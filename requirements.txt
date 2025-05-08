@@ -1,5 +1,4 @@
-telebot
-requests
+python-telegram-bot
 pydub
-SpeechRecognition
-ffmpeg
+requests
+python-dotenv
