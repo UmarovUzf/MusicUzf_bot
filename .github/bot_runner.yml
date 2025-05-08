@@ -7,6 +7,11 @@ jobs:
   run-bot:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - run: |-
-          # Botni ishga tushirish komandalari
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+      - run: pip install -r requirements.txt
+      - run: python Musicbot.py
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
