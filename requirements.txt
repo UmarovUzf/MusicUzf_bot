@@ -1,4 +1,5 @@
 telebot
-pytube
-SpeechRecognition
+requests
 pydub
+SpeechRecognition
+ffmpeg
