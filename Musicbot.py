@@ -1,84 +1,163 @@
-import telebot
 import os
+import logging
+from io import BytesIO
+from typing import Dict
+import sqlite3
+import datetime
+
 import requests
-import json
 from pydub import AudioSegment
-import speech_recognition as sr
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Updater, 
+    CommandHandler, 
+    MessageHandler, 
+    Filters, 
+    CallbackContext,
+    CallbackQueryHandler,
+    PicklePersistence
+)
 
-bot = telebot.TeleBot("YOUR_TELEGRAM_TOKEN_HERE")
+# Log konfiguratsiyasi
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# AudD API uchun (https://audd.io/)
-AUDD_API_KEY = "YOUR_AUDD_API_KEY"
+# Bot konfiguratsiyasi
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+LANGUAGES = {
+    'uz': {'name': 'Oʻzbekcha', 'flag': '🇺🇿'},
+    'ru': {'name': 'Русский', 'flag': '🇷🇺'},
+    'en': {'name': 'English', 'flag': '🇬🇧'}
+}
+DEFAULT_LANGUAGE = 'uz'
 
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    bot.reply_to(message, "🎵 Salom! Menga musiqaning 10-15 soniyalik qismini yuboring, men uni tanib, to'liq ma'lumotini topib beraman!")
-
-@bot.message_handler(content_types=['voice', 'audio'])
-def handle_audio(message):
-    try:
-        # Ovozli xabarni yuklab olish
-        if message.voice:
-            file_info = bot.get_file(message.voice.file_id)
-            file_ext = 'ogg'
-        else:
-            file_info = bot.get_file(message.audio.file_id)
-            file_ext = message.audio.file_name.split('.')[-1]
+class MusicSearchBot:
+    def __init__(self):
+        # SQLite bazasini ishga tushirish
+        self.conn = sqlite3.connect('music_bot.db', check_same_thread=False)
+        self.create_tables()
         
-        downloaded_file = bot.download_file(file_info.file_path)
+        # Foydalanuvchi ma'lumotlarini saqlash uchun
+        self.persistence = PicklePersistence(filename='music_bot_persistence')
         
-        # Faylga saqlash
-        audio_file = f'audio.{file_ext}'
-        with open(audio_file, 'wb') as new_file:
-            new_file.write(downloaded_file)
+    def create_tables(self):
+        """Bazada jadvallarni yaratish"""
+        cursor = self.conn.cursor()
         
-        # Agar OGG formatida bo'lsa, MP3 ga o'tkazamiz
-        if file_ext == 'ogg':
-            audio = AudioSegment.from_ogg(audio_file)
-            audio.export('audio.mp3', format='mp3')
-            audio_file = 'audio.mp3'
+        # Foydalanuvchilar jadvali
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            language TEXT DEFAULT 'uz',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
         
-        # AudD API orqali musiqa tanib olish
-        with open(audio_file, 'rb') as f:
-            files = {'file': f}
-            data = {
-                'api_token': AUDD_API_KEY,
-                'return': 'apple_music,spotify',
-                'language': 'en,ru,uz'
-            }
-            response = requests.post('https://api.audd.io/', data=data, files=files)
+        # So'rovlar tarixi jadvali
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS requests (
+            request_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            request_type TEXT,
+            query TEXT,
+            response TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )
+        ''')
         
-        result = json.loads(response.text)
-        
-        if result['status'] == 'success' and result['result']:
-            song = result['result']
-            reply = f"🎶 Topilgan musiqa:\n\n"
-            reply += f"📌 Nomi: {song['title']}\n"
-            reply += f"👨‍🎤 Ijrochi: {song['artist']}\n"
-            reply += f"⏳ Davomiyligi: {song['song_length']} soniya\n"
-            reply += f"📅 Chiqarilgan yili: {song['release_date'] or 'Nomaʼlum'}\n\n"
-            
-            if 'apple_music' in song:
-                reply += f"🍎 Apple Music: {song['apple_music']['url']}\n"
-            if 'spotify' in song:
-                reply += f"🟢 Spotify: {song['spotify']['external_urls']['spotify']}\n"
-            
-            # Topilgan musiqaning 10 ta versiyasini qidirish
-            search_url = f"https://api.audd.io/findLyrics/?q={song['title']} {song['artist']}&api_token={AUDD_API_KEY}"
-            search_response = requests.get(search_url)
-            search_results = json.loads(search_response.text)
-            
-            if search_results['status'] == 'success' and search_results['result']:
-                reply += "\n🔍 Topilgan versiyalar:\n"
-                for i, version in enumerate(search_results['result'][:10], 1):  # Faqat 10 ta versiya
-                    reply += f"{i}. {version['title']} - {version['artist']} ({version['album']})\n"
-            
-            bot.reply_to(message, reply)
-        else:
-            bot.reply_to(message, "❌ Musiqani tanib bo'lmadi. Iltimos, yana bir bor urinib ko'ring!")
+        self.conn.commit()
     
-    except Exception as e:
-        bot.reply_to(message, f"⚠️ Xatolik yuz berdi: {str(e)}")
-
-if __name__ == '__main__':
-    bot.polling(none_stop=True)
+    def get_user_language(self, user_id: int) -> str:
+        """Foydalanuvchi tilini olish"""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT language FROM users WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        return result[0] if result else DEFAULT_LANGUAGE
+    
+    def set_user_language(self, user_id: int, language: str) -> None:
+        """Foydalanuvchi tilini o'rnatish"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'INSERT OR REPLACE INTO users (user_id, language) VALUES (?, ?)',
+            (user_id, language)
+        )
+        self.conn.commit()
+    
+    def log_request(self, user_id: int, request_type: str, query: str, response: str) -> None:
+        """So'rovlarni log qilish"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'INSERT INTO requests (user_id, request_type, query, response) VALUES (?, ?, ?, ?)',
+            (user_id, request_type, query, response)
+        self.conn.commit()
+    
+    def start(self, update: Update, context: CallbackContext) -> None:
+        """Boshlash xabarini yuborish va tilni tanlash"""
+        user_id = update.effective_user.id
+        
+        # Foydalanuvchini bazaga qo'shish
+        self.set_user_language(user_id, DEFAULT_LANGUAGE)
+        
+        keyboard = [
+            [
+                InlineKeyboardButton(f"{LANGUAGES['uz']['flag']} Oʻzbekcha", callback_data='setlang_uz'),
+                InlineKeyboardButton(f"{LANGUAGES['ru']['flag']} Русский", callback_data='setlang_ru'),
+                InlineKeyboardButton(f"{LANGUAGES['en']['flag']} English", callback_data='setlang_en'),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        update.message.reply_text(
+            "Assalomu alaykum! Tilni tanlang / Здравствуйте! Выберите язык / Hello! Choose a language:",
+            reply_markup=reply_markup
+        )
+    
+    def set_language(self, update: Update, context: CallbackContext) -> None:
+        """Foydalanuvchi tilini o'rnatish"""
+        query = update.callback_query
+        query.answer()
+        
+        language_code = query.data.split('_')[1]
+        user_id = query.from_user.id
+        self.set_user_language(user_id, language_code)
+        
+        # Tilga mos javob
+        responses = {
+            'uz': "Til oʻzgartirildi! Endi sizga Oʻzbekcha xabarlar yuboriladi.",
+            'ru': "Язык изменён! Теперь вам будут приходить сообщения на русском.",
+            'en': "Language changed! You'll now receive messages in English."
+        }
+        
+        query.edit_message_text(text=responses.get(language_code, responses['uz']))
+    
+    def get_response(self, user_id: int, key: str) -> str:
+        """Tilga mos javob olish"""
+        language = self.get_user_language(user_id)
+        
+        responses = {
+            'help': {
+                'uz': "Yordam:\n\nMatn yuboring - qoʻshiqni izlash\nOvozli xabar yuboring - Shazam kabi qoʻshiqni aniqlash",
+                'ru': "Помощь:\n\nОтправьте текст - поиск песни\nОтправьте голосовое сообщение - распознать песню как Shazam",
+                'en': "Help:\n\nSend text - search for a song\nSend voice message - identify song like Shazam"
+            },
+            'search_prompt': {
+                'uz': "Qoʻshiq nomi yoki ijrochini yuboring:",
+                'ru': "Отправьте название песни или исполнителя:",
+                'en': "Send song title or artist:"
+            },
+            'voice_prompt': {
+                'uz': "Ovozli xabaringizni yuboring (qoʻshiqni Shazam kabi aniqlash uchun):",
+                'ru': "Отправьте голосовое сообщение (для распознавания песни как Shazam):",
+                'en': "Send a voice message (to identify song like Shazam):"
+            },
+            'searching': {
+                'uz': "Qidirilmoqda...",
+                'ru': "Идёт поиск...",
+                'en': "Searching..."
+            },
+            'no_results': {
+                'uz': "Hech narsa topilmadi. Boshqa soʻzlar bilan qayta urinib
